@@ -1,0 +1,447 @@
+---
+title: "Breast Cancer Dataset"
+author: "Yuval Yakubov"
+date: "March 22, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The goal of this project is to apply a **predictive model** to the  [breast cancer dataset](https://archive.ics.uci.edu/ml/datasets/breast+cancer),
+to predict if a patient that previously had cancer will have a reoccurence of cancer. Since one of the predictive models is a general linear model we want to interpret the effects of the covariates on the reccurence of cancer. Breast cancer is the most common cancer among women, in 2017 26,300 women where diagnosed with cancer in Canada.
+
+
+![](https://files.constantcontact.com/fd1b41d9201/a967390c-ae8b-4457-8097-029c90a3411f.png?a=1128910132548)
+
+
+
+##Import Statments
+
+```{r warning = FALSE,message = FALSE}
+library(ggplot2)
+library(ggcorrplot)
+library(DataExplorer)
+library(dplyr)
+library(gridExtra)
+library(MASS)
+library(mice)
+library(DMwR)
+library(caret)
+library(e1071)
+library(ROSE)
+library(rpart)
+library(ROCR)
+library(reshape2)
+```
+
+## Import the dataset and organize it
+
+```{r warning = FALSE}
+#We will need this to convert our categorical variable to numeric
+as.numeric.factor <- function(x) {as.numeric(levels(x))[x]}
+
+cancer_data<-read.table("https://archive.ics.uci.edu/ml/machine-learning-databases/breast-cancer/breast-cancer.data",header=FALSE,sep=",")
+
+colnames(cancer_data)<-c("Class","age","menopause","tumorsize","invnodes","nodecaps","degmalig","breast","breastquad","irradiat")
+
+#This variable is a factor
+cancer_data$degmalig<-as.factor(cancer_data$degmalig)
+
+#We want to change all the ?? to NA so we can recognize it
+cancer_data[cancer_data=="?"]<-NA
+
+
+#To get rid of the question marks as a level
+cancer_data$breastquad<-as.integer(cancer_data$breastquad)
+cancer_data$breastquad<-as.factor(cancer_data$breastquad)
+
+cancer_data$nodecaps<-as.integer(cancer_data$nodecaps)
+cancer_data$nodecaps<-as.factor(cancer_data$nodecaps)
+
+#Lets take a look at our data
+str(cancer_data)
+
+
+```
+The response variable is the class which tells us if the event
+of recurrence of cancer will occur or not. There are 9 explanatory variables which are listed below:
+
+
+* age which describes the age of the patient, has a range of 10-99 with 9 subintervals of length 10 (i.e 10-19,20-29,...,90-99)
+* menopause which decribes the state of menopause the patient is in there are 3 levels ge40,lt40, and premano (pre-menopause)
+* tumorsize which is the dimateter of tumor in mm. The range is from 0-59 and there are 12 subintervals of length 5 (i.e 0-4,5-9,10-14,....,55-59)
+* invnodes is the number of lymph nodes which have the breast cancer. The range is from 0-39 and there are 13 subintervals of length 3 (i.e 0-2,3-5,6-8,...,36-39)
+* nodecaps is a variable that says if the cancer cells have inflitrated through the lymph node. This is a binary variable with yes or no
+* degmalig is the degree of malignancy (level 1,2,3) which depends on stage of cancer
+* breast is the breast where the cancer was found
+* breastquad is the varible of where on the breast the cancer was found on. This variable has the following levels left-up,left-low,right-up,right-low,central
+* irradiat explains if there is irradiation or not
+
+## Missing Values
+```{r echo=FALSE}
+plot_missing(cancer_data)
+```
+
+The plot above shows us that we have missing values for breastquad and nodecaps. Let us investigate breastquad missing values first. There is only 1 row with missing values in breastquad this tells us automatically that it must be missing completely at random; This means that we could impute if we choose to. We could also do listwise deletion since it is MCAR but first lets evaluate the row that is missing and similair rows to it.
+
+```{r warning=FALSE}
+library(knitr)
+row_similair<-which(cancer_data$menopause == 'ge40' & cancer_data$degmalig == 3 & cancer_data$breast=='left' & cancer_data$nodecaps==2 & cancer_data$tumorsize=='30-34' )
+kable(cancer_data[row_similair,])
+```
+
+
+The table above shows us similair entries to the missing data. In the table it can be seen that similair individuals had a value for 3 in breastquad. We will then run KNN with k=1 to 12. The barplot tells us that we should impute 3 into the row with the missing entity.
+
+```{r warning=FALSE}
+list_breast_quad<-rep(0,12)
+for(i in 1:12){
+  #We are imputing the missing value with KNN
+  test<-knnImputation(data=cancer_data,k=i,meth='median')
+  #We want to store the value that is imputed
+  list_breast_quad[i]<-as.numeric.factor(test$breastquad[207])
+}
+#We want to plot the values from gg plot
+ggplot(data.frame(list_breast_quad),aes(seq_along(list_breast_quad),list_breast_quad))+geom_bar(stat="identity")+xlab("K value") + ylab("value of row 207")
+
+cancer_data$breastquad[207]<-3
+
+```
+
+## Nodecaps Missing value
+
+```{r warning=FALSE,echo=FALSE}
+rows_missing_nodecaps<-which(is.na(cancer_data$nodecaps))
+kable(cancer_data[rows_missing_nodecaps,])
+```
+
+Above is a table with all the missing values for nodecap. First we want to look to see if there is some pattern. There seems to be no pattern in Class we have both non recurrence and recurrences. My first thought was that since nodecaps means cancer cells have inflitrated the lymph nodes, maybe certain patients that had recurrence would not want to reveal this data, but this doesn't seem to be the case. There is a large variety of ages so no pattern there, but all the missing values are for age's above 40. The other explanatory variables seem to have no pattern. Since there is 2.8% missing values we will impute since we don't want to introduce any bias. First we use MICE with logistic regression:
+```{r warning=FALSE,message=FALSE,results='hide'}
+
+imputed_mice<-mice(cancer_data,method='logreg',m=3)
+mice_cancer_data<-complete(imputed_mice)
+```
+
+```{r warning=FALSE}
+densityplot(imputed_mice, ~nodecaps)
+```
+
+The blue line in our MICE plot is the density of the observed values, and only the 8 imputed values from each of our 3 imputations is shown in pink. We see that the shape of each imputation is similair to observed density. That means this imputations seems reasonable. We used 3 imputations since  [White et all., 2011](https://onlinelibrary.wiley.com/doi/full/10.1002/sim.4067) recommends an imputation for each 1 percent missing value.
+Next we will compare MICE  with KNN from k=1 to 12. We will output a graph with the count of individuals with nodecaps is false.
+```{r warning=FALSE}
+list_knn<-c(1:12)
+for(i in 1:12){
+  #We run KNN imputation
+  knn_imputation_nodecap<-knnImputation(data=cancer_data,k=i,meth='median')
+  #save how many nodecaps==2 we get in each iteration of knn
+  list_knn[i]<-sum(knn_imputation_nodecap$nodecaps==2)
+}
+ggplot(data.frame(list_knn),aes(seq_along(list_knn),list_knn))+geom_bar(stat="identity")+xlab("K value") + ylab("count of nodecap=2")
+
+list_knn
+```
+
+We see that the for the most common count of nodecaps being false is 225 or 226. So we will test the difference with KNN with 4 neighbors (226 count) with KNN with 7 neighbors (225 count).
+```{r warning=FALSE}
+knn_imputation_3<-knnImputation(data=cancer_data,k=3,meth='median')
+which(mice_cancer_data$nodecaps!=knn_imputation_3$nodecaps)
+
+
+knn_imputation_7<-knnImputation(data=cancer_data,k=7,meth='median')
+which(mice_cancer_data$nodecaps!=knn_imputation_7$nodecaps)
+```
+
+We see that KNN with 3 neighbors has only 2 different rows then MICE and KNN with 7 neighbors has 3 different values then MICE. KNN does suffer from the curse of dimensionality but our data is not that high dimension. However we will use MICE since it is a multiple imputation method.
+```{r warning=FALSE}
+cancer_data$nodecaps<-mice_cancer_data$nodecaps
+plot_missing(cancer_data)
+```
+
+### NO MORE MISSING VALUES!!!!!!!!!!!!!!
+
+
+## Exploratory Data Analysis
+
+```{r warning=FALSE}
+ggplot(cancer_data,aes(x=age))+geom_bar()+facet_wrap(~Class)
+
+#We want to see the distriubtion for our response
+ggplot(cancer_data,aes(x=age))+geom_bar()
+```
+
+We see that the majority of the people are from 40-69. We also see that for non reccurences there is a smaller count of age 40-49 then 50-59; this is not the case for reccurences.
+Next we look at the distribution of menopause as well as the count of the type of menopause for each age.
+
+```{r warning=FALSE}
+ggplot(cancer_data,aes(x=menopause))+geom_bar() + facet_wrap(~Class)
+
+
+agg<-count(cancer_data,Class,age,menopause)
+
+mutate_plot<-mutate(agg,age=reorder(age,-n,sum),menopause=reorder(menopause,-n,sum))
+ggplot(mutate_plot) + geom_col(aes(x=age,y=n,fill=menopause), position = "dodge")+facet_wrap(~Class)
+
+```
+
+We see that the variable with the biggest mode is premopause.We also see that there is a turning point when individuals turn 50 based on the plot. Before 50 there are more premenopause then menopause but this changes after 50.
+Now lets take a closer look at tumor size. The first plot shows us the distribution of tumorsize for each class. The second plot shows us the distribution for tumor size for each age in each class.
+
+```{r warning=FALSE}
+
+
+ggplot(cancer_data,aes(x=tumorsize))+geom_bar() + facet_wrap(~Class)
+
+
+agg1<-count(cancer_data,Class,age,tumorsize)
+mutate_plot_tumorsize<-mutate(agg1,age=reorder(age,-n,sum),tumorsize=reorder(tumorsize,-n,sum))
+
+tumor_age_plot <- ggplot(mutate_plot_tumorsize) +
+  geom_col(aes(x=age,y=n,fill=tumorsize), position = "dodge")
+
+tumor_age_plot+facet_wrap(~Class)
+
+
+```
+
+The distribution plot of tumor size tells us the majority of individuals in this trial have a tumor size from 10-34. What is interesting is that in the recurrence class until tumor size 34 the graph is increasing for each interval and then stops.
+Next we will look at the distribution of breast.
+
+
+```{r warning=FALSE}
+
+ggplot(cancer_data,aes(x=breast))+geom_bar() + facet_wrap(~Class)
+
+```
+
+
+There seems to be roughly the same amount of cancer on the left breast and right breast.
+Now we will look at the distribution of irradiat.
+
+```{r warning=FALSE}
+
+ggplot(cancer_data,aes(x=irradiat))+geom_bar()+ facet_wrap(~Class)
+
+```
+
+For non reccurence there seems to be a big difference between the amount of individuals without irradiation and with irradiation , but in the recurrence class there isn't as big of a difference. This could be a hypothesis to test later does irradiation have an effect on breast cancer reoccurence?
+
+Next we look at the distribution of breastquad.
+
+```{r warning=FALSE}
+
+ggplot(cancer_data,aes(x=breastquad))+geom_bar()+ facet_wrap(~Class)
+
+```
+
+It seems that the majority of individuals previously had breast cancer on right-upper and left-low.
+
+### Last but not least lets look at the distribution of our response variable
+
+```{r warning=FALSE,echo=FALSE}
+ggplot(cancer_data,aes(x=Class))+geom_bar()
+
+
+```
+
+
+Our data seems to be unbalanced, this essentially means that we have more of one class then another class. This can create some problems because our predictive model might not be able to predict recurrences well. This means that we should balance the data.
+
+
+## Let us Get into fitting the different models
+
+To avoid having a bias we will split our data into training and testing. This splitting process will be done randomly,
+and we will have 80% of data to train and 20% of data to test.
+
+```{r warning=FALSE}
+sample_size<-floor(0.8 * nrow(cancer_data))
+
+set.seed(430)
+sample_rows<-sample(seq_len(nrow(cancer_data)),size=sample_size)
+
+train_cancer_data<-cancer_data[sample_rows,]
+test_cancer_data<-cancer_data[-sample_rows,]
+
+```
+Now to show the difference that balancing data can make we will use a decision tree which is a superivsed machine learning algorithm (typically I am not a fan of decision trees due to them having a large variance).
+
+```{r warning=FALSE}
+library(rpart.plot)
+decision_tree_cancer <- rpart(Class ~ ., data = train_cancer_data,method='class')
+rpart.plot(decision_tree_cancer, extra = 106)
+
+
+
+```
+
+```{r warning=FALSE}
+#now we want to change the class to 0 being no recurrence and 1 being recurrence
+levels(cancer_data$Class)<-c(0,1)
+prediciton_tree_cancer <- predict(decision_tree_cancer, newdata = test_cancer_data,type='class')
+table_mat <- table(test_cancer_data$Class, prediciton_tree_cancer)
+accuracy_decision <- sum(diag(table_mat)) / sum(table_mat)
+print(paste('Accuracy for decision tree is', accuracy_decision))
+roc.curve(test_cancer_data$Class, prediciton_tree_cancer)
+
+```
+
+We have a pretty good accuracy but let us see the score of accuracy from other balancing methods.
+
+```{r warning=FALSE}
+#Over sampling method for balancing data
+cancer_data_over <- ovun.sample(Class ~ ., data = train_cancer_data, method = "over",N = 330)$data
+#Under Sampling method for balancing data
+cancer_data_under <- ovun.sample(Class ~ ., data = train_cancer_data, method = "under", N = 126, seed = 1)$data
+#ROSE sampling for balancing data
+cancer_data_rose <- ROSE(Class ~ ., data = train_cancer_data, seed = 1)$data
+#Both under sampling and over sampling for balancing data
+cancer_data_both <- ovun.sample(Class ~ ., data = train_cancer_data, method = "both", p=0.35,N=228, seed = 1)$data
+
+#We now make some trees with our "balanced data"
+tree_rose <- rpart(Class ~ ., data = cancer_data_rose)
+tree_over <- rpart(Class ~ ., data = cancer_data_over)
+tree_under <- rpart(Class ~ ., data = cancer_data_under)
+tree_both <- rpart(Class ~ ., data = cancer_data_both)
+
+#Now we actually do the prediction
+predicition_rose <- predict(tree_rose, newdata = test_cancer_data,type='class')
+predicition_over <- predict(tree_over, newdata = test_cancer_data,type='class')
+predicition_under <- predict(tree_under, newdata = test_cancer_data,type='class')
+predicition_both <- predict(tree_both, newdata = test_cancer_data,type='class')
+
+#Now we make the tables
+table_rose <- table(test_cancer_data$Class, predicition_rose)
+table_over <- table(test_cancer_data$Class, predicition_over)
+table_under <- table(test_cancer_data$Class, predicition_under)
+table_both <- table(test_cancer_data$Class, predicition_both)
+
+#Now we get the accuracy
+accuracy_rose <- sum(diag(table_rose)) / sum(table_rose)
+accuracy_over <- sum(diag(table_over)) / sum(table_over)
+accuracy_under <- sum(diag(table_under)) / sum(table_under)
+accuracy_both <- sum(diag(table_both)) / sum(table_both)
+
+print(paste('Accuracy for rise tree is', accuracy_rose))
+print(paste('Accuracy for rise tree is', accuracy_over))
+print(paste('Accuracy for rise tree is', accuracy_under))
+print(paste('Accuracy for rise tree is', accuracy_both))
+
+
+
+
+roc.curve(test_cancer_data$Class, predicition_rose)
+roc.curve(test_cancer_data$Class, predicition_over)
+roc.curve(test_cancer_data$Class, predicition_under)
+roc.curve(test_cancer_data$Class, predicition_both)
+
+
+
+```
+
+
+It is interesting the accuracy of all the balancing methods seem to be worse then our
+unbalanced data that is because accuracy is the not the best metric to check all of the time. We see that ROSE and 
+over sampling have a better AUC metric.
+
+Next we will take a look at logistic regression and its results:
+
+
+```{r warning=FALSE}
+
+
+full_model<-glm(Class~. ,family=binomial,data=train_cancer_data)
+
+predict_glm <- predict(full_model, newdata = test_cancer_data,type='response')
+roc.curve(test_cancer_data$Class, predict_glm)
+table_glm<-table(test_cancer_data$Class, predict_glm > 0.55)
+
+accuracy_full<-sum(diag(table_glm)) / sum(table_glm)
+print(paste("This is full model accuracy ",accuracy_full))
+
+
+#Next we will look at backwards selection
+
+backwards_glm<-step(full_model,trace=0) 
+predict_backwards <- predict(backwards_glm, newdata = test_cancer_data,type='response')
+roc.curve(test_cancer_data$Class, predict_backwards)
+table_backwards_glm<-table(test_cancer_data$Class, predict_backwards > 0.35)
+accuarcy_backwards<-sum(diag(table_backwards_glm)) / sum(table_backwards_glm)
+print(paste("This is backwards accuracy ",accuarcy_backwards))
+
+#Now we look at stepwise selection
+stepwise_glm <- stepAIC(full_model, trace = FALSE)
+predict_stepwise <- predict(stepwise_glm, newdata = test_cancer_data,type='response')
+roc.curve(test_cancer_data$Class, predict_stepwise)
+table_stepwise_glm<-table(test_cancer_data$Class, predict_stepwise > 0.35)
+accuarcy_stepwise<-sum(diag(table_stepwise_glm)) / sum(table_stepwise_glm)
+print(paste("This is stepwise accuracy ",accuarcy_stepwise))
+
+
+```
+
+It seems that stepwise and backwards are the same model so we shall use the backward model as the default. From the accuracy and AUC metric we shall choose logistic regression over the decission tree. What we want to see next is can we still get better values by using a balancing method and logistic regression.
+
+
+```{r warning=FALSE}
+
+glm_rose <- glm(Class~. ,family=binomial,data=cancer_data_rose)
+glm_over <- glm(Class~. ,family=binomial,data=cancer_data_over)
+glm_under <- glm(Class~. ,family=binomial,data=cancer_data_under)
+glm_both <- glm(Class~. ,family=binomial,data=cancer_data_both)
+
+#Now we will use stepwise selection
+stepwise_rose <- stepAIC(glm_rose, trace = FALSE)
+stepwise_over <- stepAIC(glm_over, trace = FALSE)
+stepwise_under <- stepAIC(glm_under, trace = FALSE)
+stepwise_both <- stepAIC(glm_both, trace = FALSE)
+
+#Now we predict
+predict_rose <- predict(stepwise_rose, newdata = test_cancer_data,type='response')
+predict_over <- predict(stepwise_over, newdata = test_cancer_data,type='response')
+predict_under <- predict(stepwise_under, newdata = test_cancer_data,type='response')
+predict_both <- predict(stepwise_both, newdata = test_cancer_data,type='response')
+
+#Now we show ROC
+roc.curve(test_cancer_data$Class, predict_rose)
+roc.curve(test_cancer_data$Class, predict_over)
+roc.curve(test_cancer_data$Class, predict_under)
+roc.curve(test_cancer_data$Class, predict_both)
+
+#Compute accuracy
+table_rose_glm<-table(test_cancer_data$Class, predict_rose > 0.95)
+rose_accuracy_glm<-sum(diag(table_rose_glm)) / sum(table_rose_glm)
+
+table_over_glm<-table(test_cancer_data$Class, predict_over > 0.6)
+over_accuracy_glm<-sum(diag(table_over_glm)) / sum(table_over_glm)
+
+table_under_glm<-table(test_cancer_data$Class, predict_under > 0.8)
+under_accuracy_glm<-sum(diag(table_under_glm)) / sum(table_under_glm)
+
+table_both_glm<-table(test_cancer_data$Class, predict_both > 0.97)
+both_accuracy_glm<-sum(diag(table_both_glm)) / sum(table_both_glm)
+
+
+list_best_values<-list(full_model=accuracy_full,stepwise_model=accuarcy_stepwise,rose_model=rose_accuracy_glm,over_accuracy=over_accuracy_glm,under_accuracy=under_accuracy_glm,both_accuracy=both_accuracy_glm)
+p1<-ggplot(melt(data.frame(list_best_values)),aes(x=variable,y=value))+geom_bar(stat='identity')+labs(x = "methods",y="Accuracy value")
+p1+ggtitle("Best\n Methods")+theme(plot.title = element_text(lineheight=1, face="bold",hjust=0.5))
+
+
+```
+
+
+From the last graph we see that the stepwise model without any balancing methods has better AUC and better accuracy than any balancing methods as well as all the tree methods.
+
+Next what we want to do is get the log odds ratios for our stepwise logistic regression.
+
+```{r warning=FALSE}
+summary(stepwise_glm)
+print(paste("The odds ratio for nodecaps is ",exp(stepwise_glm$coefficients[2])))
+
+print(paste("The odds ratio for degree malignany of 2 is ",exp(stepwise_glm$coefficients[3])))
+
+print(paste("The odds ratio for degree malignany of 3 is ",exp(stepwise_glm$coefficients[4])))
+
+```
+
+Essentially what the above tells us is if the cancer inflitrated through the lymph nodes then the indvidual is 2 times more likely to get cancer. Also if the individual has level 3 malignancy then the individual is 3.16 more likely to get cancer.
